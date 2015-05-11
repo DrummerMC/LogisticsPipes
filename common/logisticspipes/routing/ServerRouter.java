@@ -24,6 +24,7 @@ import java.util.PriorityQueue;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.UUID;
+import java.util.concurrent.Callable;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
@@ -46,6 +47,7 @@ import logisticspipes.request.resources.FluidResource;
 import logisticspipes.request.resources.IResource;
 import logisticspipes.request.resources.ItemResource;
 import logisticspipes.routing.pathfinder.PathFinder;
+import logisticspipes.ticks.QueuedTasks;
 import logisticspipes.ticks.RoutingTableUpdateThread;
 import logisticspipes.utils.CacheHolder;
 import logisticspipes.utils.OneList;
@@ -296,6 +298,9 @@ public class ServerRouter implements IRouter, Comparable<ServerRouter> {
 	}
 
 	private void ensureRouteTableIsUpToDate(boolean force){
+		if(force) {
+			ensureAdjCheck();
+		}
 		if (_LSAVersion > _lastLSAVersion[simpleID]) {
 			if(Configs.MULTI_THREAD_NUMBER > 0 && !force) {
 				RoutingTableUpdateThread.add(new UpdateRouterRunnable(this));
@@ -325,10 +330,7 @@ public class ServerRouter implements IRouter, Comparable<ServerRouter> {
 	private ITileEntityChangeListener localChangeListener = new ITileEntityChangeListener() {
 		@Override
 		public void pipeRemoved(LPPosition pos) {
-			boolean blockNeedsUpdate = checkAdjacentUpdate();
-			if (blockNeedsUpdate) {
-				updateAdjacentAndLsa();
-			}
+			checkAdjacentAndSendUpdate();
 			if(Configs.MULTI_THREAD_NUMBER > 0) {
 				ensureRouteTableIsUpToDate(false);
 			}
@@ -336,10 +338,7 @@ public class ServerRouter implements IRouter, Comparable<ServerRouter> {
 		
 		@Override
 		public void pipeAdded(LPPosition pos, ForgeDirection side) {
-			boolean blockNeedsUpdate = checkAdjacentUpdate();
-			if (blockNeedsUpdate) {
-				updateAdjacentAndLsa();
-			}
+			checkAdjacentAndSendUpdate();
 			if(Configs.MULTI_THREAD_NUMBER > 0) {
 				ensureRouteTableIsUpToDate(false);
 			}
@@ -347,10 +346,7 @@ public class ServerRouter implements IRouter, Comparable<ServerRouter> {
 
 		@Override
 		public void pipeModified(LPPosition pos) {
-			boolean blockNeedsUpdate = checkAdjacentUpdate();
-			if (blockNeedsUpdate) {
-				updateAdjacentAndLsa();
-			}
+			checkAdjacentAndSendUpdate();
 			if(Configs.MULTI_THREAD_NUMBER > 0) {
 				ensureRouteTableIsUpToDate(false);
 			}
@@ -902,7 +898,75 @@ public class ServerRouter implements IRouter, Comparable<ServerRouter> {
 		pipe.refreshRender(true);
 		return true;
 	}
-
+	
+	private AdjCheck call;
+	
+	private void ensureAdjCheck() {
+		if(call != null) {
+			call.canRun = false;
+			call = null;
+			boolean blockNeedsUpdate = checkAdjacentUpdate();
+			if (blockNeedsUpdate) {
+				updateAdjacentAndLsa();
+			}
+		}
+	}
+	
+	private void checkAdjacentAndSendUpdate() {
+		if(call == null) {
+			call = new AdjCheck();
+			QueuedTasks.queueAdjCheck(call);
+		}
+	}
+	
+	private void checkAdjacentAndSendUpdateSpread(BitSet visited) {
+		if(call == null) {
+			call = new AdjCheckSpread(visited);
+			QueuedTasks.queueAdjCheck(call);
+		}
+	}
+	
+	public class AdjCheck implements Callable<Boolean> {
+		boolean canRun = true;
+		
+		@Override
+		public Boolean call() throws Exception {
+			if(!canRun) return false;
+			boolean blockNeedsUpdate = checkAdjacentUpdate();
+			if (blockNeedsUpdate) {
+				updateAdjacentAndLsa();
+			}
+			call = null;
+			return true;
+		}
+	}
+	
+	public class AdjCheckSpread extends AdjCheck {
+		boolean canRun = true;
+		BitSet visited;
+		
+		AdjCheckSpread(BitSet visited) {
+			this.visited = visited;
+		}
+		
+		@Override
+		public Boolean call() throws Exception {
+			if(!canRun) return false;
+			boolean blockNeedsUpdate = checkAdjacentUpdate();
+			if (blockNeedsUpdate) {
+				updateAdjacentAndLsa();
+				for(IRouter r : _adjacentRouter.keySet()) {
+					if(!visited.get(simpleID)) {
+						visited.set(simpleID);
+						((ServerRouter)r).checkAdjacentAndSendUpdateSpread(visited);
+					}
+				}
+			}
+			call = null;
+			return true;
+		}
+	}
+	
 	/**
 	 * Floodfill LSA increment and clean up the _prevAdjacentRouter list left by floodCheckAdjacent
 	 */
@@ -938,22 +1002,24 @@ public class ServerRouter implements IRouter, Comparable<ServerRouter> {
 	private void updateAdjacentAndLsa() {
 		//this already got a checkAdjacentUpdate, so start the recursion with neighbors
 		BitSet visited = new BitSet(ServerRouter.getBiggestSimpleID());
-		IRAction flood = new floodCheckAdjacent();
+		//IRAction flood = new floodCheckAdjacent();
 		visited.set(simpleID);
 		// for all connected updatecurrent and previous
 		for(IRouter r : _adjacentRouter_Old.keySet()) {
-			r.act(visited, flood);
+			//r.act(visited, flood);
+			((ServerRouter)r).checkAdjacentAndSendUpdateSpread(visited);
 		}
 		for(IRouter r : _adjacentRouter.keySet()) {
-			r.act(visited, flood);
+			//r.act(visited, flood);
+			((ServerRouter)r).checkAdjacentAndSendUpdateSpread(visited);
 		}
 		//now increment LSA version in the network
-		visited.clear();
+		BitSet visited2 = new BitSet(ServerRouter.getBiggestSimpleID());
 		for(IRouter r : _adjacentRouter_Old.keySet()) {
-			r.act(visited, new flagForLSAUpdate());
+			r.act(visited2, new flagForLSAUpdate());
 		}
 		_adjacentRouter_Old = new HashMap<IRouter, ExitRoute>();
-		this.act(visited, new flagForLSAUpdate());
+		this.act(visited2, new flagForLSAUpdate());
 	}
 	
 	@Override
